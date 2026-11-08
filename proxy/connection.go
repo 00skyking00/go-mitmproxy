@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	uuid "github.com/google/uuid"
 )
@@ -84,6 +86,98 @@ type ConnContext struct {
 	proxy              *Proxy
 	closeAfterResponse bool                        // after http response, http server will close the connection
 	dialFn             func(context.Context) error // when begin request, if there no ServerConn, use this func to dial
+
+	// clientMu guards clientActive, h2Handlers and closeClientWhenIdle. An
+	// HTTP/1 client connection is active from when the attacker server starts
+	// reading a request on it until that request's response has been written;
+	// an HTTP/2 one while any of its streams' handlers is running.
+	clientMu            sync.Mutex
+	clientActive        bool
+	h2Handlers          int
+	closeClientWhenIdle bool
+}
+
+// deferredClientCloseLimit bounds how long a deferred client close waits for
+// the response in progress, so a client that stalls mid-request cannot hold
+// the connection open indefinitely.
+const deferredClientCloseLimit = time.Minute
+
+// h2FlushGrace is how long a deferred close of an HTTP/2 client connection
+// waits after its last handler returns: the HTTP/2 server writes a stream's
+// final frames after the handler returns, and has no hook for when it has.
+const h2FlushGrace = 500 * time.Millisecond
+
+// closeClientOrDefer closes the client connection, unless a request on it is
+// still being answered; then the close waits until that answer has been
+// written. The server connection can close before the answer reaches the
+// client: an upstream that answers before it has read the whole request body
+// (for example, rejecting a bad credential with "Connection: keep-alive") is
+// closed by the transport as soon as the answer is read, because the request
+// write is still in progress. Closing the client at that moment drops the
+// answer, and the client sees a reset instead of the upstream's response.
+func (connCtx *ConnContext) closeClientOrDefer() {
+	connCtx.clientMu.Lock()
+	if connCtx.clientActive || connCtx.h2Handlers > 0 {
+		connCtx.closeClientWhenIdle = true
+		connCtx.clientMu.Unlock()
+		time.AfterFunc(deferredClientCloseLimit, func() {
+			connCtx.clientMu.Lock()
+			pending := connCtx.closeClientWhenIdle
+			connCtx.closeClientWhenIdle = false
+			connCtx.clientMu.Unlock()
+			if pending {
+				connCtx.ClientConn.Conn.Close()
+			}
+		})
+		return
+	}
+	connCtx.clientMu.Unlock()
+	connCtx.ClientConn.Conn.Close()
+}
+
+// h2HandlerStarted and h2HandlerDone bracket a handler serving one stream of
+// an HTTP/2 client connection. When the last handler returns and a close was
+// deferred, the connection is closed once its final frames have gone out.
+func (connCtx *ConnContext) h2HandlerStarted() {
+	connCtx.clientMu.Lock()
+	connCtx.h2Handlers++
+	connCtx.clientMu.Unlock()
+}
+
+func (connCtx *ConnContext) h2HandlerDone() {
+	connCtx.clientMu.Lock()
+	connCtx.h2Handlers--
+	closeNow := connCtx.h2Handlers == 0 && connCtx.closeClientWhenIdle
+	if closeNow {
+		connCtx.closeClientWhenIdle = false
+	}
+	connCtx.clientMu.Unlock()
+	if closeNow {
+		time.AfterFunc(h2FlushGrace, func() { connCtx.ClientConn.Conn.Close() })
+	}
+}
+
+// clientStateChanged follows the HTTP/1 attacker server's view of the client
+// connection c, and performs a close that closeClientOrDefer deferred once
+// the response in progress has been written.
+func (connCtx *ConnContext) clientStateChanged(c net.Conn, state http.ConnState) {
+	connCtx.clientMu.Lock()
+	switch state {
+	case http.StateActive:
+		connCtx.clientActive = true
+	case http.StateIdle:
+		connCtx.clientActive = false
+		if connCtx.closeClientWhenIdle {
+			connCtx.closeClientWhenIdle = false
+			connCtx.clientMu.Unlock()
+			_ = c.Close()
+			return
+		}
+	case http.StateHijacked, http.StateClosed:
+		connCtx.clientActive = false
+		connCtx.closeClientWhenIdle = false
+	}
+	connCtx.clientMu.Unlock()
 }
 
 func newConnContext(c net.Conn, proxy *Proxy) *ConnContext {
