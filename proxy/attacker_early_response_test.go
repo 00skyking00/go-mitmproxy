@@ -132,13 +132,15 @@ func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string,
 		t.Fatalf("client got %v; want the upstream's 401", err)
 	}
 	defer resp.Body.Close()
+	// Read the whole body first: a response that starts and then resets is not
+	// a complete response, whatever its status.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("response %d ended with %v; want a complete response", resp.StatusCode, err)
+	}
 	if allowBadGateway && resp.StatusCode == http.StatusBadGateway {
 		t.Logf("transport reported the upstream close first; the proxy answered 502")
 		return
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("reading the 401 body: %v", err)
 	}
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "has been revoked") {
 		t.Fatalf("got %d %q; want the upstream's 401", resp.StatusCode, body)
