@@ -115,8 +115,10 @@ func earlyAnswerClient(t *testing.T, proxyURL *url.URL, http2 bool) *http.Client
 
 // postLargeAndRequireAnswer posts 32 MiB, large enough that the proxy's upload
 // upstream is still running when the answer arrives (loopback socket buffers
-// absorb a few MiB), and requires the upstream's 401 to reach the client.
-func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string) {
+// absorb a few MiB), and requires the upstream's 401 to reach the client. With
+// allowBadGateway, the proxy's own 502 is accepted in its place (see the HTTP/2
+// test); a missing response never is.
+func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string, allowBadGateway bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -130,6 +132,10 @@ func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string)
 		t.Fatalf("client got %v; want the upstream's 401", err)
 	}
 	defer resp.Body.Close()
+	if allowBadGateway && resp.StatusCode == http.StatusBadGateway {
+		t.Logf("transport reported the upstream close first; the proxy answered 502")
+		return
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("reading the 401 body: %v", err)
@@ -142,11 +148,17 @@ func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string)
 func TestAttackerDeliversEarlyKeepAliveAnswerToHTTP1Client(t *testing.T) {
 	upstream := earlyAnswerUpstream(t, false, true)
 	client := earlyAnswerClient(t, startEarlyAnswerProxy(t), false)
-	postLargeAndRequireAnswer(t, client, upstream.URL+"/v1/messages")
+	postLargeAndRequireAnswer(t, client, upstream.URL+"/v1/messages", false)
 }
 
-func TestAttackerDeliversAnswerBeforeUpstreamGOAWAYToHTTP2Client(t *testing.T) {
+// An upstream that sends GOAWAY and closes right after its early answer. Before
+// the fix the HTTP/2 client got no response (unexpected EOF). After it the
+// client always gets a complete response: the upstream's 401, or the proxy's
+// 502 when x/net/http2's RoundTrip sees the lost connection before the answer
+// (it picks between the two at random once both are ready, which a slow
+// machine makes possible).
+func TestAttackerAnswersHTTP2ClientWhenUpstreamClosesAfterAnswering(t *testing.T) {
 	upstream := earlyAnswerUpstream(t, true, false)
 	client := earlyAnswerClient(t, startEarlyAnswerProxy(t), true)
-	postLargeAndRequireAnswer(t, client, upstream.URL+"/v1/messages")
+	postLargeAndRequireAnswer(t, client, upstream.URL+"/v1/messages", true)
 }
