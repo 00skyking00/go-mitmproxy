@@ -75,6 +75,13 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 	}
 
 	a.server = a.newServerConfig()
+	// Only the HTTP/1 server gets the hook: its connections are attackerConn.
+	// HTTP/2 connections are counted in ServeHTTP.
+	a.server.ConnState = func(c net.Conn, state http.ConnState) {
+		if ac, ok := c.(*attackerConn); ok {
+			ac.connCtx.clientStateChanged(state)
+		}
+	}
 
 	a.h2Server = &http2.Server{
 		MaxConcurrentStreams: 100, // todo: wait for remote server setting
@@ -144,6 +151,12 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 }
 
 func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	if req.ProtoMajor == 2 {
+		if connCtx, ok := req.Context().Value(connContextKey).(*ConnContext); ok {
+			connCtx.h2HandlerStarted()
+			defer connCtx.h2HandlerDone()
+		}
+	}
 	if req.URL.Scheme == "" {
 		connCtx := req.Context().Value(connContextKey).(*ConnContext)
 		req.URL.Scheme = "https"
