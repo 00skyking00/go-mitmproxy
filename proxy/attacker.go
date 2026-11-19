@@ -75,6 +75,13 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 	}
 
 	a.server = a.newServerConfig()
+	// Only the HTTP/1 server gets the hook: its connections are attackerConn.
+	// HTTP/2 connections are counted in ServeHTTP.
+	a.server.ConnState = func(c net.Conn, state http.ConnState) {
+		if ac, ok := c.(*attackerConn); ok {
+			ac.connCtx.clientStateChanged(state)
+		}
+	}
 
 	a.h2Server = &http2.Server{
 		MaxConcurrentStreams: 100, // todo: wait for remote server setting
@@ -144,6 +151,14 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 }
 
 func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	if req.ProtoMajor == 2 {
+		// A stream that arrives after the server connection has closed is not
+		// counted, so it cannot hold off the deferred close.
+		if connCtx, ok := req.Context().Value(connContextKey).(*ConnContext); ok && !connCtx.upstreamGone() {
+			connCtx.h2HandlerStarted()
+			defer connCtx.h2HandlerDone()
+		}
+	}
 	if req.URL.Scheme == "" {
 		connCtx := req.Context().Value(connContextKey).(*ConnContext)
 		req.URL.Scheme = "https"
@@ -190,6 +205,22 @@ func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	}
 
 	a.attack(res, req)
+}
+
+// closeH2ClientIfUpstreamGone sets "Connection: close" on an HTTP/2 response
+// when the server connection has already closed. The HTTP/2 server then sends
+// GOAWAY, so the client stops opening streams on a connection where they can
+// only fail, and closes the connection once the open streams have finished.
+func closeH2ClientIfUpstreamGone(res http.ResponseWriter, req *http.Request) {
+	if req.ProtoMajor != 2 {
+		return
+	}
+	connCtx, ok := req.Context().Value(connContextKey).(*ConnContext)
+	if !ok || !connCtx.upstreamGone() {
+		return
+	}
+	res.Header().Set("Connection", "close")
+	connCtx.h2GoAwayRequested()
 }
 
 func (a *attacker) initHttpDialFn(req *http.Request) {
@@ -469,6 +500,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		if response.close {
 			res.Header().Set("Connection", "close")
 		}
+		closeH2ClientIfUpstreamGone(res, req)
 		res.WriteHeader(response.StatusCode)
 
 		flusher, _ := res.(http.Flusher)
@@ -630,6 +662,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		for _, addon := range proxy.Addons {
 			addon.RequestError(f, err)
 		}
+		closeH2ClientIfUpstreamGone(res, req)
 		res.WriteHeader(502)
 		return
 	}
