@@ -152,7 +152,9 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 
 func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	if req.ProtoMajor == 2 {
-		if connCtx, ok := req.Context().Value(connContextKey).(*ConnContext); ok {
+		// A stream that arrives after the server connection has closed is not
+		// counted, so it cannot hold off the deferred close.
+		if connCtx, ok := req.Context().Value(connContextKey).(*ConnContext); ok && !connCtx.upstreamGone() {
 			connCtx.h2HandlerStarted()
 			defer connCtx.h2HandlerDone()
 		}
@@ -203,6 +205,22 @@ func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	}
 
 	a.attack(res, req)
+}
+
+// closeH2ClientIfUpstreamGone sets "Connection: close" on an HTTP/2 response
+// when the server connection has already closed. The HTTP/2 server then sends
+// GOAWAY, so the client stops opening streams on a connection where they can
+// only fail, and closes the connection once the open streams have finished.
+func closeH2ClientIfUpstreamGone(res http.ResponseWriter, req *http.Request) {
+	if req.ProtoMajor != 2 {
+		return
+	}
+	connCtx, ok := req.Context().Value(connContextKey).(*ConnContext)
+	if !ok || !connCtx.upstreamGone() {
+		return
+	}
+	res.Header().Set("Connection", "close")
+	connCtx.h2GoAwayRequested()
 }
 
 func (a *attacker) initHttpDialFn(req *http.Request) {
@@ -482,6 +500,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		if response.close {
 			res.Header().Set("Connection", "close")
 		}
+		closeH2ClientIfUpstreamGone(res, req)
 		res.WriteHeader(response.StatusCode)
 
 		flusher, _ := res.(http.Flusher)
@@ -643,6 +662,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		for _, addon := range proxy.Addons {
 			addon.RequestError(f, err)
 		}
+		closeH2ClientIfUpstreamGone(res, req)
 		res.WriteHeader(502)
 		return
 	}

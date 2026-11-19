@@ -64,9 +64,13 @@ func earlyAnswerUpstream(t *testing.T, enableHTTP2, keepAlive bool) *httptest.Se
 	return upstream
 }
 
-// startEarlyAnswerProxy starts a proxy that buffers whole request and response
-// bodies, and returns its URL.
-func startEarlyAnswerProxy(t *testing.T) *url.URL {
+// bufferWholeBodies is a StreamLargeBodies that no body reaches, so the proxy
+// reads the client's whole request before it sends anything upstream.
+const bufferWholeBodies = 0x7FFFFFFFFFFFFFFE
+
+// startEarlyAnswerProxy starts a proxy and returns its URL. A streamLargeBodies
+// of 0 leaves the default, which streams bodies of 5 MiB and more.
+func startEarlyAnswerProxy(t *testing.T, streamLargeBodies int64, addons ...Addon) *url.URL {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	handleError(t, err)
@@ -75,11 +79,14 @@ func startEarlyAnswerProxy(t *testing.T) *url.URL {
 
 	p, err := NewProxy(&Options{
 		Addr:              addr,
-		StreamLargeBodies: 0x7FFFFFFFFFFFFFFE,
+		StreamLargeBodies: streamLargeBodies,
 		SslInsecure:       true,
 		NewCaFunc:         cert.NewSelfSignCAMemory,
 	})
 	handleError(t, err)
+	for _, addon := range addons {
+		p.AddAddon(addon)
+	}
 	go func() { _ = p.Start() }()
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -115,10 +122,8 @@ func earlyAnswerClient(t *testing.T, proxyURL *url.URL, http2 bool) *http.Client
 
 // postLargeAndRequireAnswer posts 32 MiB, large enough that the proxy's upload
 // upstream is still running when the answer arrives (loopback socket buffers
-// absorb a few MiB), and requires the upstream's 401 to reach the client. With
-// allowBadGateway, the proxy's own 502 is accepted in its place (see the HTTP/2
-// test); a missing response never is.
-func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string, allowBadGateway bool) {
+// absorb a few MiB), and requires the upstream's 401 to reach the client.
+func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -138,27 +143,48 @@ func postLargeAndRequireAnswer(t *testing.T, client *http.Client, target string,
 	if err != nil {
 		t.Fatalf("response %d ended with %v; want a complete response", resp.StatusCode, err)
 	}
-	if allowBadGateway && resp.StatusCode == http.StatusBadGateway {
-		t.Logf("transport reported the upstream close first; the proxy answered 502")
-		return
-	}
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "invalid credentials") {
 		t.Fatalf("got %d %q; want the upstream's 401", resp.StatusCode, body)
 	}
 }
 
-func TestAttackerDeliversEarlyKeepAliveAnswerToHTTP1Client(t *testing.T) {
-	upstream := earlyAnswerUpstream(t, false, true)
-	client := earlyAnswerClient(t, startEarlyAnswerProxy(t), false)
-	postLargeAndRequireAnswer(t, client, upstream.URL+"/upload", false)
+// clientCloseBound is how long the proxy gets to close the client connection
+// after the answer. It is far below deferredClientCloseLimit, so a connection
+// that only the limit would close fails the test.
+const clientCloseBound = 5 * time.Second
+
+// testEarlyAnswer requires the upstream's early 401 to reach the client, and
+// the proxy to close the client connection afterwards, since its upstream
+// connection is gone. It runs once with the proxy buffering the request body,
+// so the client has finished sending when the answer arrives, and once with
+// the default StreamLargeBodies, where the body is streamed and the client is
+// still sending.
+func testEarlyAnswer(t *testing.T, http2, keepAlive bool) {
+	for _, tc := range []struct {
+		name              string
+		streamLargeBodies int64
+	}{
+		{"body buffered", bufferWholeBodies},
+		{"body streamed", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newConnRecorder()
+			upstream := earlyAnswerUpstream(t, http2, keepAlive)
+			client := earlyAnswerClient(t, startEarlyAnswerProxy(t, tc.streamLargeBodies, rec), http2)
+			postLargeAndRequireAnswer(t, client, upstream.URL+"/upload")
+			rec.requireClientsClosed(t, clientCloseBound)
+		})
+	}
 }
 
-// The upstream sends GOAWAY and closes right after its early answer. The client
-// must get a complete response: the upstream's 401, or the proxy's 502 when
-// x/net/http2's RoundTrip sees the closed connection first. Both can be ready
-// at once, and RoundTrip then picks one at random.
+func TestAttackerDeliversEarlyKeepAliveAnswerToHTTP1Client(t *testing.T) {
+	testEarlyAnswer(t, false, true)
+}
+
+// The upstream sends GOAWAY and closes right after its early answer. The
+// answer and the closed connection can both be ready when x/net/http2's
+// RoundTrip looks, and it then returns the answer (golang/go#49645), so the
+// client must get the upstream's 401 and never the proxy's 502.
 func TestAttackerAnswersHTTP2ClientWhenUpstreamClosesAfterAnswering(t *testing.T) {
-	upstream := earlyAnswerUpstream(t, true, false)
-	client := earlyAnswerClient(t, startEarlyAnswerProxy(t), true)
-	postLargeAndRequireAnswer(t, client, upstream.URL+"/upload", true)
+	testEarlyAnswer(t, true, false)
 }
